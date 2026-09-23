@@ -1,0 +1,211 @@
+/**
+ * @file engine_v1_hash.cpp
+ * @brief High-throughput LOB using std::map (Red-Black Trees).
+ * Fits entirely in L1/L2 CPU Cache.
+ */
+
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <map>
+#include <chrono>
+#include <random>
+
+namespace hft {
+    constexpr uint32_t MAX_ORDERS = 2000000;
+
+    struct Limit;
+
+    struct Order {
+        uint64_t order_id;
+        bool is_buy;
+        uint32_t price_tick;
+        uint32_t size;
+        
+        Order* prev_order;
+        Order* next_order;
+        Limit* parent_limit;
+        
+        Order() : order_id(0), is_buy(false), price_tick(0), size(0), 
+                  prev_order(nullptr), next_order(nullptr), parent_limit(nullptr) {}
+    };
+
+    struct Limit {
+        uint32_t price_tick;
+        uint32_t total_volume;
+        uint32_t order_count;
+        Order* head_order;
+        Order* tail_order;
+        
+        Limit() : price_tick(0), total_volume(0), order_count(0), head_order(nullptr), tail_order(nullptr) {}
+    };
+
+    class OrderBook {
+    private:
+        // O(log N) price level lookups, but highly cache-efficient memory footprint
+        std::map<uint32_t, Limit, std::greater<uint32_t>> bids;
+        std::map<uint32_t, Limit> asks;
+
+        std::vector<Order*> order_index;     
+        std::vector<Order*> free_orders;
+        std::vector<Order*> all_allocated_orders; 
+
+        inline Order* get_order_from_pool(uint64_t id, bool is_buy, uint32_t price, uint32_t size) {
+            Order* order = free_orders.back();
+            free_orders.pop_back();
+            order->order_id = id;
+            order->is_buy = is_buy;
+            order->price_tick = price;
+            order->size = size;
+            order->prev_order = nullptr;
+            order->next_order = nullptr;
+            return order;
+        }
+
+        void remove_order_node(Order* order) {
+            Limit* limit = order->parent_limit;
+
+            if (order->prev_order != nullptr) order->prev_order->next_order = order->next_order;
+            else limit->head_order = order->next_order;
+
+            if (order->next_order != nullptr) order->next_order->prev_order = order->prev_order;
+            else limit->tail_order = order->prev_order;
+
+            limit->total_volume -= order->size;
+            limit->order_count -= 1;
+
+            if (limit->order_count == 0) {
+                if (order->is_buy) bids.erase(order->price_tick);
+                else asks.erase(order->price_tick);
+            }
+
+            order_index[order->order_id] = nullptr;
+            free_orders.push_back(order); 
+        }
+
+        void match_orders() {
+            while (!bids.empty() && !asks.empty()) {
+                auto best_bid_it = bids.begin();
+                auto best_ask_it = asks.begin();
+
+                if (best_bid_it->first < best_ask_it->first) break;
+
+                Limit& bid_limit = best_bid_it->second;
+                Limit& ask_limit = best_ask_it->second;
+
+                Order* bid_order = bid_limit.head_order;
+                Order* ask_order = ask_limit.head_order;
+
+                uint32_t trade_size = std::min(bid_order->size, ask_order->size);
+
+                bid_order->size -= trade_size;
+                ask_order->size -= trade_size;
+                
+                bid_limit.total_volume -= trade_size;
+                ask_limit.total_volume -= trade_size;
+
+                if (bid_order->size == 0) remove_order_node(bid_order);
+                if (ask_order->size == 0) remove_order_node(ask_order);
+            }
+        }
+
+    public:
+        OrderBook(size_t pool_size = MAX_ORDERS) {
+            free_orders.reserve(pool_size);
+            all_allocated_orders.reserve(pool_size);
+            order_index.resize(pool_size + 10, nullptr);
+
+            for (size_t i = 0; i < pool_size; ++i) {
+                Order* new_order = new Order();
+                free_orders.push_back(new_order);
+                all_allocated_orders.push_back(new_order); 
+            }
+        }
+
+        ~OrderBook() {
+            for (Order* order : all_allocated_orders) delete order;
+        }
+
+        void add_order(uint64_t id, bool is_buy, uint32_t price_tick, uint32_t size) {
+            Order* new_order = get_order_from_pool(id, is_buy, price_tick, size);
+            order_index[id] = new_order; 
+
+            Limit* target_limit;
+            if (is_buy) target_limit = &bids[price_tick];
+            else target_limit = &asks[price_tick];
+            
+            target_limit->price_tick = price_tick;
+            new_order->parent_limit = target_limit;
+            
+            if (target_limit->head_order == nullptr) {
+                target_limit->head_order = new_order;
+                target_limit->tail_order = new_order;
+            } else {
+                new_order->prev_order = target_limit->tail_order;
+                target_limit->tail_order->next_order = new_order;
+                target_limit->tail_order = new_order;
+            }
+            
+            target_limit->total_volume += size;
+            target_limit->order_count += 1;
+
+            match_orders();
+        }
+
+        void cancel_order(uint64_t id) {
+            if (id < order_index.size() && order_index[id] != nullptr) {
+                remove_order_node(order_index[id]);
+            }
+        }
+    };
+} // namespace hft
+
+void run_speed_test(int num_messages) {
+    hft::OrderBook engine(num_messages + 100);
+    std::mt19937 gen(42); 
+    std::uniform_int_distribution<uint32_t> price_dist(9000, 11000); 
+    std::uniform_int_distribution<uint32_t> size_dist(10, 500);
+    std::uniform_int_distribution<int> side_dist(0, 1);
+    std::uniform_int_distribution<int> action_dist(1, 100);
+
+    struct Message { int type; uint64_t id; bool is_buy; uint32_t price; uint32_t size; };
+    std::vector<Message> messages(num_messages);
+    
+    uint64_t current_id = 1;
+    std::vector<uint64_t> active_ids;
+    active_ids.reserve(num_messages);
+
+    for (int i = 0; i < num_messages; ++i) {
+        if (action_dist(gen) <= 80 || active_ids.empty()) {
+            messages[i] = {1, current_id, (bool)side_dist(gen), price_dist(gen), size_dist(gen)};
+            active_ids.push_back(current_id);
+            current_id++;
+        } else {
+            std::uniform_int_distribution<size_t> index_dist(0, active_ids.size() - 1);
+            size_t idx = index_dist(gen);
+            messages[i] = {2, active_ids[idx], false, 0, 0};
+            active_ids[idx] = active_ids.back();
+            active_ids.pop_back();
+        }
+    }
+
+    std::cout << "Starting Tree-Based Engine Benchmark...\n";
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < num_messages; ++i) {
+        if (messages[i].type == 1) engine.add_order(messages[i].id, messages[i].is_buy, messages[i].price, messages[i].size);
+        else engine.cancel_order(messages[i].id);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = end - start;
+    
+    std::cout << "Processed: " << num_messages << " messages\n";
+    std::cout << "Time taken: " << diff.count() << " seconds\n";
+    std::cout << "Throughput: " << (int)(num_messages / diff.count()) << " ops/sec\n";
+}
+
+int main() {
+    run_speed_test(1000000);
+    return 0;
+}
