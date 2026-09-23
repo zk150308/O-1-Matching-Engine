@@ -7,7 +7,7 @@ A low-latency, zero-allocation Limit Order Book (LOB) matching engine written in
 This repository contains two iterations of the matching engine, demonstrating a classic hardware tradeoff:
 
 **Version 1: Red-Black Tree Indexing (`engine_v1_hash.cpp`)**
-* **Throughput:** ~18.3 million ops/sec (Apple Silicon M3).
+* **Throughput:** ~18.3 million ops/sec (Apple Silicon M2 Pro).
 * **Architecture:** Utilizes a custom pre-allocated object pool (`std::vector<Order*>`) and direct array indexing for order IDs. 
 * **The Catch:** It relies on `std::map` (a Red-Black Tree) for price levels, meaning price resolution is theoretically $O(\log N)$. However, because the memory footprint is extremely small, it fits entirely within the CPU's ultra-fast L1/L2 cache, resulting in massive real-world throughput.
 
